@@ -1,0 +1,179 @@
+import React, { useRef, useState, useEffect } from "react";
+
+// VoiceNoiseReduction_ClientSite.jsx // Single-file React component (Tailwind-ready) that creates a simple client-side // "reduce background noise" experience for video files. // // What it does (practical, runs fully in the browser): // 1. Lets user pick a video file. // 2. Plays the video in a <video> element. // 3. When user clicks "Reduce Noise", the audio path is routed through //    a small processing graph built with the Web Audio API: //    - High-pass filter (removes low rumble) //    - Optional band-pass / compressor //    - A modest noise-gate implemented in JS (frame RMS detection + attenuation) // 4. The processed audio is played back synchronized with the video (we keep //    the original video visuals but replace the audio output path). This is a //    lightweight, client-side approach — gives noticeable improvement for //    many common background noises (room hum, low-frequency noise, constant hiss). // // Limitations / notes: // - This is NOT as powerful as an RNNoise / deep-learning denoiser, but it //   works offline in the browser, needs no API keys, and is fast. // - ScriptProcessorNode is used here for simplicity and cross-browser support. //   In production you can replace this with an AudioWorklet for lower latency. // - The noise-gate/attenuation parameters are exposed so you can tune them. // // Usage: drop this component into a React app. Tailwind classes are used for // styling but it's optional.
+
+export default function VoiceNoiseReductionClientSite() { const videoRef = useRef(null); const [fileName, setFileName] = useState(null); const audioCtxRef = useRef(null); const sourceRef = useRef(null); const procNodeRef = useRef(null); const processingOnRef = useRef(false); const [isProcessing, setIsProcessing] = useState(false); const [threshold, setThreshold] = useState(0.01); // RMS threshold for gate const [reductionDb, setReductionDb] = useState(18); // attenuation when below threshold const [hpFreq, setHpFreq] = useState(120); // high-pass frequency
+
+useEffect(() => { return () => { // cleanup audio context on unmount if (audioCtxRef.current) { try { audioCtxRef.current.close(); } catch (e) {} audioCtxRef.current = null; } }; }, []);
+
+async function handleFile(e) { const file = e.target.files[0]; if (!file) return; setFileName(file.name); const url = URL.createObjectURL(file); if (videoRef.current) { videoRef.current.src = url; videoRef.current.load(); } }
+
+function ensureAudioGraph() { if (!audioCtxRef.current) { const AudioContext = window.AudioContext || window.webkitAudioContext; audioCtxRef.current = new AudioContext(); }
+
+const audioCtx = audioCtxRef.current;
+
+// If we already have a source node, reuse
+if (!sourceRef.current) {
+  // create MediaElementSource from the video element
+  sourceRef.current = audioCtx.createMediaElementSource(videoRef.current);
+}
+
+// If we already have a proc node, disconnect it to rebuild
+if (procNodeRef.current) {
+  try { procNodeRef.current.disconnect(); } catch (e) {}
+  procNodeRef.current = null;
+}
+
+// Build processing chain:
+// source -> highpass -> compressor -> scriptProcessor (gate) -> destination
+const hp = audioCtx.createBiquadFilter();
+hp.type = "highpass";
+hp.frequency.value = hpFreq;
+
+const compressor = audioCtx.createDynamicsCompressor();
+// gentle compressor preset
+compressor.threshold.value = -24;
+compressor.knee.value = 30;
+compressor.ratio.value = 3;
+compressor.attack.value = 0.003;
+compressor.release.value = 0.25;
+
+// ScriptProcessor for simple noise-gate
+// bufferSize 4096 for compatibility. In production use AudioWorklet.
+const bufferSize = 4096;
+const proc = audioCtx.createScriptProcessor(bufferSize, 1, 1);
+
+// noise-gate state
+let smoothing = 0.95; // smoothing factor for RMS
+let env = 0.0; // smoothed RMS
+const attenuation = Math.pow(10, -reductionDb / 20); // linear gain when below threshold
+
+proc.onaudioprocess = (event) => {
+  const input = event.inputBuffer.getChannelData(0);
+  const output = event.outputBuffer.getChannelData(0);
+
+  // compute RMS of the frame (simple)
+  let sum = 0.0;
+  for (let i = 0; i < input.length; i++) {
+    sum += input[i] * input[i];
+  }
+  const rms = Math.sqrt(sum / input.length);
+
+  // smooth the RMS to avoid rapid gating
+  env = Math.max(rms, env * smoothing);
+
+  // decide gain
+  const gateOpen = env >= threshold;
+  const gain = gateOpen ? 1.0 : attenuation;
+
+  // apply gain to output
+  for (let i = 0; i < input.length; i++) {
+    output[i] = input[i] * gain;
+  }
+};
+
+// wire up
+sourceRef.current.connect(hp);
+hp.connect(compressor);
+compressor.connect(proc);
+proc.connect(audioCtx.destination);
+
+// store refs
+procNodeRef.current = { proc, hp, compressor };
+
+}
+
+async function toggleProcessing() { if (!videoRef.current) return;
+
+// if turning on
+if (!isProcessing) {
+  try {
+    ensureAudioGraph();
+    // resume audio context in case it was suspended
+    const actx = audioCtxRef.current;
+    if (actx && actx.state === 'suspended') await actx.resume();
+
+    // mute the video's default audio output to avoid duplicate sound
+    videoRef.current.muted = true;
+
+    processingOnRef.current = true;
+    setIsProcessing(true);
+  } catch (err) {
+    console.error('Error enabling processing', err);
+    alert('Failed to enable processing: ' + err.message);
+  }
+} else {
+  // turning off: disconnect processing and restore original audio
+  if (procNodeRef.current && sourceRef.current) {
+    try {
+      sourceRef.current.disconnect();
+      // reconnect source straight to destination by creating a fresh MediaElementAudioSource
+      // (we will recreate sourceRef when toggling back on)
+      // first disconnect existing proc graph
+      procNodeRef.current.proc.disconnect();
+      procNodeRef.current.hp.disconnect();
+      procNodeRef.current.compressor.disconnect();
+    } catch (e) {}
+    // reconnect source directly to default destination
+    try {
+      // Note: connect() to destination may create echo if video element isn't muted
+      sourceRef.current.connect(audioCtxRef.current.destination);
+    } catch (e) {}
+  }
+
+  // unmute video so it uses browser's built-in audio route
+  videoRef.current.muted = false;
+  processingOnRef.current = false;
+  setIsProcessing(false);
+
+  // clear the proc node ref so next enable will rebuild graph
+  procNodeRef.current = null;
+  sourceRef.current = null;
+}
+
+}
+
+return ( <div className="max-w-3xl mx-auto p-6"> <h1 className="text-2xl font-bold mb-4">Voice Noise Reduction — Client-side</h1> <p className="mb-4 text-sm text-gray-600">Upload a video, press play, then click "Reduce Noise" to route audio through a simple client-side denoiser (high-pass + gate + compressor). No API keys, runs fully in your browser.</p>
+
+<div className="mb-4">
+    <input type="file" accept="video/*" onChange={handleFile} />
+    {fileName && <div className="mt-2 text-sm text-gray-700">Loaded: {fileName}</div>}
+  </div>
+
+  <div className="mb-4">
+    <video ref={videoRef} controls className="w-full bg-black rounded" />
+  </div>
+
+  <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mb-4">
+    <button onClick={toggleProcessing} className="py-2 px-3 rounded bg-blue-600 text-white">{isProcessing ? 'Disable Noise Reduction' : 'Enable Noise Reduction'}</button>
+    <button onClick={() => { if (videoRef.current) { videoRef.current.currentTime = 0; videoRef.current.play(); } }} className="py-2 px-3 rounded bg-gray-200">Play from start</button>
+    <button onClick={() => { if (videoRef.current) videoRef.current.pause(); }} className="py-2 px-3 rounded bg-gray-200">Pause</button>
+  </div>
+
+  <div className="bg-gray-50 p-4 rounded">
+    <h3 className="font-semibold mb-2">Tuning</h3>
+    <div className="mb-2">
+      <label className="text-sm">High-pass cutoff: {hpFreq} Hz</label>
+      <input type="range" min="20" max="1000" value={hpFreq} onChange={(e) => { setHpFreq(Number(e.target.value)); if (procNodeRef.current) procNodeRef.current.hp.frequency.value = Number(e.target.value); }} />
+    </div>
+    <div className="mb-2">
+      <label className="text-sm">Noise gate threshold (RMS): {threshold}</label>
+      <input type="range" min="0.0005" max="0.05" step="0.0005" value={threshold} onChange={(e) => setThreshold(Number(e.target.value))} />
+    </div>
+    <div>
+      <label className="text-sm">Attenuation when gated: {reductionDb} dB</label>
+      <input type="range" min="6" max="36" value={reductionDb} onChange={(e) => setReductionDb(Number(e.target.value))} />
+    </div>
+    <p className="text-xs text-gray-500 mt-2">Tip: increase high-pass to remove hum, raise threshold to be more aggressive, increase attenuation for stronger suppression.</p>
+  </div>
+
+  <div className="mt-4 text-sm text-gray-600">
+    <strong>Notes:</strong>
+    <ul className="list-disc ml-5">
+      <li>This approach replaces the video's audio output by muting the video element and playing processed audio through the Web Audio API — playback is kept in sync but there can be a small latency depending on browser.</li>
+      <li>For better results (speech-oriented denoising) you can integrate an RNNoise/WASM or other ML model; that requires additional libraries but the UI/flow remains similar.</li>
+    </ul>
+  </div>
+</div>
+
+); }
